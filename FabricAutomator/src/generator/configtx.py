@@ -1,0 +1,392 @@
+# Copyright (c) 2026 Rian Carlos Valcanaia - Licensed under MIT License
+"""
+Responsável por gerar o arquivo de configuração configtx.yaml 
+(contendo definições de organizações, capacidades e perfis de canais) 
+e o script shell create_artifacts.sh. Este último é utilizado para 
+criar o bloco gênese e os blocos de configuração dos canais via configtxgen.
+"""
+import os
+import stat
+from ..utils import Colors as co
+
+class ConfigTxGenerator:
+    def __init__(self, config, paths):
+        # inicializa as configuracoes e caminhos necessarios
+        self.config = config
+        self.paths = paths
+        # define a saida do script e do configtx.yaml
+        self.config_output_path = self.paths.network_dir / "configtx.yaml"
+        self.script_saida = self.paths.scripts_dir / "create_artifacts.sh"
+
+    def generate(self):        
+        # gera as secoes do configtx.yaml
+        organizations_section = self._build_organizations_section()
+        capabilities_section = self._build_capabilities_section()
+        application_section = self._build_application_section()
+        orderer_section = self._build_orderer_section()
+        channel_section = self._build_channel_section()
+        profiles_section = self._build_profiles_section()
+
+        # monta o conteúdo final
+        content = (
+            f"{organizations_section}"
+            f"{capabilities_section}\n"
+            f"{application_section}\n"
+            f"{orderer_section}"
+            f"{channel_section}\n"
+            f"{profiles_section}\n"
+        )
+
+        # salva o arquivo
+        with open(self.config_output_path, 'w') as f:
+            f.write(content)
+        
+        co.successln(f"Arquivo configtx.yaml gerado em: {self.config_output_path}")
+
+        # gera o script shell
+        self._create_shell_script()
+
+    # constroi a secao de organizacoes do configtx.yaml, incluindo a org do orderer e as orgs de peer
+    def _build_organizations_section(self):
+        domain = self.config['network_topology']['network']['domain']
+        orgs_yaml = "Organizations:\n"
+
+        # criando orderer Org
+        ord_msp_dir = f"organizations/ordererOrganizations/{domain}/msp"
+        orderer_endpoints = self._get_orderer_endpoints_list()
+        
+        orgs_yaml += "  - &OrdererOrg\n"
+        orgs_yaml += "    Name: OrdererOrg\n"
+        orgs_yaml += "    ID: OrdererMSP\n"
+        orgs_yaml += f"    MSPDir: {ord_msp_dir}\n"
+        orgs_yaml += "    Policies:\n"
+        orgs_yaml += "      Readers:\n        Type: Signature\n        Rule: \"OR('OrdererMSP.member')\"\n"
+        orgs_yaml += "      Writers:\n        Type: Signature\n        Rule: \"OR('OrdererMSP.member')\"\n"
+        orgs_yaml += "      Admins:\n        Type: Signature\n        Rule: \"OR('OrdererMSP.admin')\"\n"
+        orgs_yaml += "    OrdererEndpoints:\n"
+        for ep in orderer_endpoints:
+            orgs_yaml += f"      - {ep}\n"
+
+        # adicionando as orgs
+        for org in self.config['network_topology']['organizations']:
+            org_name = org['name']
+            msp_id = org['msp_id']
+            msp_dir = f"organizations/peerOrganizations/{org_name}.{domain}/msp"
+
+            orgs_yaml += f"  - &{org_name}\n" 
+            orgs_yaml += f"    Name: {msp_id}\n"
+            orgs_yaml += f"    ID: {msp_id}\n"
+            orgs_yaml += f"    MSPDir: {msp_dir}\n"
+            orgs_yaml += "    Policies:\n"
+            orgs_yaml += f"      Readers:\n        Type: Signature\n        Rule: \"OR('{msp_id}.admin', '{msp_id}.peer', '{msp_id}.client')\"\n"
+            orgs_yaml += f"      Writers:\n        Type: Signature\n        Rule: \"OR('{msp_id}.admin', '{msp_id}.client')\"\n"
+            orgs_yaml += f"      Admins:\n        Type: Signature\n        Rule: \"OR('{msp_id}.admin')\"\n"
+            orgs_yaml += f"      Endorsement:\n        Type: Signature\n        Rule: \"OR('{msp_id}.peer')\"\n"
+
+        return orgs_yaml
+
+    # Define politicas padrao para que as aplicacooes rodem do canal
+    def _build_capabilities_section(self):
+        ord_type = self.config['network_topology']['orderer'].get('type', 'etcdraft').lower()
+    
+        if ord_type == 'bft':
+            return """
+Capabilities:
+  Channel: &ChannelCapabilities
+    V3_0: true
+  Orderer: &OrdererCapabilities
+    V2_0: true
+  Application: &ApplicationCapabilities
+    V2_5: true"""
+        else:
+            return """
+Capabilities:
+  Channel: &ChannelCapabilities
+    V2_0: true
+  Orderer: &OrdererCapabilities
+    V2_0: true
+  Application: &ApplicationCapabilities
+    V2_5: true"""
+
+    # 
+    def _build_application_section(self):
+        return """
+Application: &ApplicationDefaults
+  Organizations:
+  Policies:
+    Readers:
+      Type: ImplicitMeta
+      Rule: "ANY Readers"
+    Writers:
+      Type: ImplicitMeta
+      Rule: "ANY Writers"
+    Admins:
+      Type: ImplicitMeta
+      Rule: "MAJORITY Admins"
+    LifecycleEndorsement:
+      Type: ImplicitMeta
+      Rule: "MAJORITY Endorsement"
+    Endorsement:
+      Type: ImplicitMeta
+      Rule: "MAJORITY Endorsement"
+  Capabilities:
+    <<: *ApplicationCapabilities
+"""
+
+    # controi a configuracao do servico de ordenacao
+    def _build_orderer_section(self):
+        domain = self.config['network_topology']['network']['domain']
+        ord_conf = self.config['network_topology']['orderer']
+        ord_type = ord_conf.get('type', 'etcdraft')
+
+        # somente por garantia de que o usuario digitou certo
+        if ord_type.lower() == 'bft':
+            ord_type = 'BFT'
+        else:
+            ord_type = 'etcdraft'
+        
+        # defaults
+        batch_timeout = ord_conf.get('batch_timeout', '2s')
+        max_msg = ord_conf.get('batch_size', {}).get('max_message_count', 10)
+        abs_max_bytes = ord_conf.get('batch_size', {}).get('absolute_max_bytes', '99 MB')
+        pref_max_bytes = ord_conf.get('batch_size', {}).get('preferred_max_bytes', '512 KB')
+        
+        yaml_content = "Orderer: &OrdererDefaults\n"
+        yaml_content += f"  OrdererType: {ord_type}\n"
+        yaml_content += "  Addresses:\n"
+            
+        yaml_content += f"  BatchTimeout: {batch_timeout}\n"
+        yaml_content += "  BatchSize:\n"
+        yaml_content += f"    MaxMessageCount: {max_msg}\n"
+        yaml_content += f"    AbsoluteMaxBytes: {abs_max_bytes}\n"
+        yaml_content += f"    PreferredMaxBytes: {pref_max_bytes}\n"
+
+        # adiciona detalhes do concenso escolhido
+        if ord_type == 'etcdraft':
+            yaml_content += self._build_raft_consenters(domain)
+        else:
+            yaml_content += self._build_smart_bft_consenters(domain)
+
+        yaml_content += "  Organizations:\n"
+        yaml_content += "  Policies:\n"
+        yaml_content += "    Readers:\n      Type: ImplicitMeta\n      Rule: \"ANY Readers\"\n"
+        yaml_content += "    Writers:\n      Type: ImplicitMeta\n      Rule: \"ANY Writers\"\n"
+        yaml_content += "    Admins:\n      Type: ImplicitMeta\n      Rule: \"MAJORITY Admins\"\n"
+        yaml_content += "    BlockValidation:\n      Type: ImplicitMeta\n      Rule: \"ANY Writers\"\n"
+        yaml_content += "  Capabilities:\n    <<: *OrdererCapabilities\n"
+        
+        return yaml_content
+
+    def _build_channel_section(self):
+        return """
+Channel: &ChannelDefaults
+  Policies:
+    Readers:
+      Type: ImplicitMeta
+      Rule: "ANY Readers"
+    Writers:
+      Type: ImplicitMeta
+      Rule: "ANY Writers"
+    Admins:
+      Type: ImplicitMeta
+      Rule: "MAJORITY Admins"
+  Capabilities:
+    <<: *ChannelCapabilities
+"""
+
+    # perfis que unem organizacoes, orderes e canais
+    def _build_profiles_section(self):
+        orgs = self.config['network_topology']['organizations']
+        channels = self.config['network_topology'].get('channels', [])
+
+        yaml_content = "Profiles:\n"
+
+        # logica para encontrar o canal de bootstrao, aquele que contém todas as orgs
+        bootstrap_channel = None
+        bootstrap_profile = None
+        for cc in channels:
+            if len(cc.get('participating_orgs', [])) == len(orgs):
+                bootstrap_channel = cc['name']  # pega o primeiro com todas as orgs para bootstrap
+                bootstrap_profile = bootstrap_channel[0].upper() + bootstrap_channel[1:] + "Profile"
+                break
+
+        if not bootstrap_channel:
+            raise Exception("Nenhum canal de bootstrap encontrado. É necessário um canal que inclua todas as organizações.")
+
+
+        yaml_content += f"  {bootstrap_profile}:\n"
+        yaml_content += "    <<: *ChannelDefaults\n"
+        yaml_content += "    Orderer:\n"
+        yaml_content += "      <<: *OrdererDefaults\n"
+
+        yaml_content += "      Organizations:\n"
+        yaml_content += "        - *OrdererOrg\n"
+        yaml_content += "      Capabilities: *OrdererCapabilities\n"
+        
+        yaml_content += "    Application:\n"
+        yaml_content += "      <<: *ApplicationDefaults\n"
+        yaml_content += "      Organizations:\n"
+
+        # adiciona todas as orgs
+        for o in orgs:
+            org_name = o['name']
+            yaml_content += f"        - *{org_name}\n"
+        yaml_content += "      Capabilities: *ApplicationCapabilities\n"
+
+        # perfis para outros canais
+        for ch in channels:
+            ch_name = ch['name']
+            profile_name = ch_name[0].upper() + ch_name[1:] + "Profile"
+            
+            if profile_name == bootstrap_profile:
+                continue  # ja criado acima
+
+            yaml_content += f"\n  {profile_name}:\n"
+            yaml_content += "    <<: *ChannelDefaults\n"
+            
+            yaml_content += "    Orderer:\n"
+            yaml_content += "      <<: *OrdererDefaults\n"
+
+            yaml_content += "      Organizations:\n"
+            yaml_content += "        - *OrdererOrg\n"
+            yaml_content += "      Capabilities: *OrdererCapabilities\n"
+
+            yaml_content += "    Application:\n"
+            yaml_content += "      <<: *ApplicationDefaults\n"
+            yaml_content += "      Organizations:\n"
+            
+            participating = ch.get('participating_orgs', [])
+
+            # adiciona todas as orgs
+            for p_org in participating:
+                yaml_content += f"        - *{p_org}\n"
+                
+            yaml_content += "      Capabilities: *ApplicationCapabilities\n"
+
+        return yaml_content
+
+    # ------------ HELPERS (Raft/BFT/Endpoints) ------------
+    def _build_raft_consenters(self, domain):
+        content = "  EtcdRaft:\n"
+        content += "    Consenters:\n"
+
+        for node in self.config['network_topology']['orderer']['nodes']:
+            host = f"{node['name']}.{domain}"
+            port = node['port']
+            server_tls = f"organizations/ordererOrganizations/{domain}/orderers/{host}/tls/server.crt"
+            content += f"      - Host: {host}\n"
+            content += f"        Port: {port}\n"
+            content += f"        ClientTLSCert: {server_tls}\n"
+            content += f"        ServerTLSCert: {server_tls}\n"
+        return content
+
+    def _build_smart_bft_consenters(self, domain):
+        content = "  SmartBFT:\n"
+        content += "    RequestBatchMaxInterval: 200ms\n"
+        content += "    RequestForwardTimeout: 2s\n"
+        content += "    RequestComplainTimeout: 20s\n"
+        content += "    RequestAutoRemoveTimeout: 3m0s\n"
+        content += "    ViewChangeResendInterval: 5s\n"
+        content += "    ViewChangeTimeout: 20s\n"
+        content += "    LeaderHeartbeatTimeout: 1m0s\n"
+        content += "    CollectTimeout: 1s\n"
+        content += "    IncomingMessageBufferSize: 200\n"
+        content += "    RequestPoolSize: 100000\n"
+        content += "    LeaderHeartbeatCount: 10\n"
+
+
+        content += "  ConsenterMapping:\n"
+        
+        for idx, node in enumerate(self.config['network_topology']['orderer']['nodes']):
+            host = f"{node['name']}.{domain}"
+            port = node['port']
+            
+            identity_cert = f"organizations/ordererOrganizations/{domain}/orderers/{host}/msp/signcerts/cert.pem"
+            server_tls = f"organizations/ordererOrganizations/{domain}/orderers/{host}/tls/server.crt"
+            client_tls = f"organizations/ordererOrganizations/{domain}/orderers/{host}/tls/server.crt"
+            
+            consenter_id = node.get('consenter_id',idx + 1)  
+
+            content += f"    - ID: {consenter_id}\n"
+            content += f"      Host: {host}\n"
+            content += f"      Port: {port}\n"
+            content += f"      MSPID: OrdererMSP\n" 
+            content += f"      Identity: {identity_cert}\n"
+            content += f"      ClientTLSCert: {client_tls}\n"
+            content += f"      ServerTLSCert: {server_tls}\n"
+            
+        return content
+    
+    def _get_orderer_endpoints_list(self):
+        endpoints = []
+        domain = self.config['network_topology']['network']['domain']
+        for node in self.config['network_topology']['orderer']['nodes']:
+            endpoints.append(f"{node['name']}.{domain}:{node['port']}")
+        return endpoints
+
+    # cria o script shell (create_artifacts.sh) para gerar os blocos de configuração usando configtxgen
+    def _create_shell_script(self):
+        channels = self.config['network_topology'].get('channels', [])
+        orgs = self.config['network_topology']['organizations']
+
+        bootstrap_profile = None
+        bootstrap_channel = None
+        for cc in channels:
+            if len(cc.get('participating_orgs', [])) == len(orgs):
+                bootstrap_channel = cc['name']  # pega o primeiro com todas as orgs para bootstrap, mesma logica do profile
+                bootstrap_profile = bootstrap_channel[0].upper() + bootstrap_channel[1:] + "Profile"
+                break
+
+        if not bootstrap_channel:
+            raise Exception("Nenhum canal de bootstrap encontrado. É necessário um canal que inclua todas as organizações.")
+        
+        linhas = []
+        linhas.append("#!/bin/bash")
+        linhas.append("set -e")
+        linhas.append(f"source {self.paths.scripts_dir}/utils.sh")
+        linhas.append(f"export PATH={self.paths.base_dir}/bin:$PATH")
+        
+        linhas.append(f"export FABRIC_CFG_PATH={self.paths.network_dir}\n")
+        output = f"{self.paths.network_dir}/channel-artifacts"
+        
+        linhas.append("# cria Genesis Block")
+        linhas.append('infoln "--- Gerando Blocos de Configuração (Fabric v3) ---"')
+        linhas.append(f"mkdir -p {output}")
+        
+        # genesis Block, para o canal de bootstrap
+        cmd_genesis = (
+            f"configtxgen -profile {bootstrap_profile} "
+            f"-channelID {bootstrap_channel} "
+            f"-outputBlock {output}/genesis.block"
+        )
+        linhas.append(f"infoln 'Gerando Genesis Block ({bootstrap_channel})...'")
+        linhas.append(cmd_genesis)
+        
+        # blocos de configuracao para outros canais
+        for ch in channels:
+            ch_name = ch['name']
+
+            if ch_name == bootstrap_channel:
+                linhas.append(f"# Copiando genesis block para o canal {ch_name}")
+                linhas.append(f"cp {output}/genesis.block {output}/{ch_name}.block")  # so para ter ele mesmo
+                continue  # ja criado acima
+            
+            profile_name = ch_name[0].upper() + ch_name[1:] + "Profile"
+            
+            cmd_channel = (
+                f"configtxgen -profile {profile_name} "
+                f"-channelID {ch_name} "
+                f"-outputBlock {output}/{ch_name}.block"
+            )
+            linhas.append(f"\n# gerando bloco para o canal {ch_name}")
+            linhas.append(f"infoln 'Gerando Block: {output}/{ch_name}.block'")
+            linhas.append(cmd_channel)
+        
+        linhas.append('\nsuccessln "Artefatos criados com sucesso!"')
+
+        with open(self.script_saida, 'w') as f:
+            f.write("\n".join(linhas))
+        
+        st = os.stat(self.script_saida)
+        os.chmod(self.script_saida, st.st_mode | stat.S_IEXEC)
+        co.successln(f"Script gerado: {self.script_saida}")

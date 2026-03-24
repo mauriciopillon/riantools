@@ -1,0 +1,239 @@
+# Copyright (c) 2026 Rian Carlos Valcanaia - Licensed under MIT License
+"""
+Validador sintático e semântico da configuração da rede (network.yaml).
+
+Verifica a existência de chaves obrigatórias, tipos de dados corretos (portas
+como inteiros) e consistência lógica (ex: se uma org referenciada em um canal
+realmente foi definida). Também aplica valores padrão (defaults) onde permitido.
+
+Rever: valida_chaincode
+"""
+import os
+from .utils import Colors as co
+
+class ConfigParser:
+    def __init__(self, config_completa):
+        # inicializa a topologia da rede pegando somente a secao relevante
+        self.topologia = config_completa.get('network_topology', {})
+        self.erros = []
+        self.avisos = []
+        
+        # set para armazenar nomes da organizacoes e validar se os canais as referenciam corretamente
+        self.orgs_definidas = set()
+
+    def valida(self):
+        """
+        Executa a sequencia completa de testes na configuracao da rede.
+        """
+        if not self.topologia:
+            self.erros.append("O arquivo network.yaml parece estar vazio ou mal formatado.")
+            return self._print_results()
+
+        # Executa a sequência de validações
+        self._valida_chaves_raizes()
+        self._valida_secao_network()
+        self._valida_organizacoes() 
+        self._valida_orderer()
+        self._valida_canais()       
+        self._valida_chaincodes()   
+
+        return self._print_results()
+
+    def _print_results(self):
+        """
+        Exibe o veredito final no terminal
+        """
+        if self.avisos:
+            for a in self.avisos:
+                co.warnln(f"{a}")
+
+        if self.erros:
+            for e in self.erros:
+                co.errorln(f"{e}")
+            co.errorln(f"Validação falhou. Encontrados {len(self.erros)} erro(s) na definição da rede.")
+            return False
+        
+        co.successln("Validação concluída com sucesso. Nenhum erro encontrado.")
+        return True
+
+    def _chaves_obrigatorias(self, dado, chaves_obrigatorias, contexto):
+        """
+        Utilitario para garantir que campos essenciais existam no yaml
+        """
+        if not isinstance(dado, dict):
+            self.erros.append(f"Em '{contexto}': Esperado um objeto (dict), recebeu {type(dado).__name__}.")
+            return False
+        
+        faltando = [chave for chave in chaves_obrigatorias if chave not in dado]
+        if faltando:
+            self.erros.append(f"Em '{contexto}': Chaves obrigatórias faltando: {faltando}")
+            return False
+        return True
+
+    # ---------------------- Validadores Específicos -------------------------
+    def _valida_chaves_raizes(self):
+        """
+        Verifica se o yaml tem as colunas principais: network, organizations e orderer
+        """
+        obrigatorios = ['network', 'organizations', 'orderer']
+        self._chaves_obrigatorias(self.topologia, obrigatorios, "Raiz do network.yaml")
+        
+    def _valida_secao_network(self):
+        """
+        Verifica nome e dominio da rede (nao podem ter espacos)
+        """
+        net = self.topologia.get('network', {})
+        if self._chaves_obrigatorias(net, ['name', 'domain'], "seção 'network'"):
+            if ' ' in net['domain']:
+                self.erros.append(f"Network Domain '{net['domain']}' não deve conter espaços.")
+
+    def _valida_organizacoes(self):
+        """
+        Valida orgs, CAs e Peers, sao aplicados defaults onde permitido
+        """
+        orgs = self.topologia.get('organizations', [])
+        if not isinstance(orgs, list) or len(orgs) == 0:
+            self.erros.append("A seção 'organizations' deve ser uma lista e conter pelo menos uma organização.")
+            return
+
+        for i, org in enumerate(orgs):
+            org_name = org.get('name', f"Org[{i}]")
+            contexto_org = f"Organização '{org_name}'"
+
+            if not self._chaves_obrigatorias(org, ['name', 'msp_id','ca', 'peers'], contexto_org):
+                continue
+            
+            # guardo o nome para validar os canais depois
+            self.orgs_definidas.add(org['name'])
+
+            # valida a CA da org
+            ca = org.get('ca')
+            if not ca:
+                self.erros.append(f"{contexto_org} não possui CA definida (obrigatório).")
+            else:
+                self._chaves_obrigatorias(ca, ['name', 'host', 'port'], f"CA de {org_name}")
+
+            # valida os peers
+            peers = org.get('peers', [])
+            if not isinstance(peers, list) or len(peers) < 1:
+                self.erros.append(f"{contexto_org} deve ter no mínimo 1 Peer definido.")
+                continue
+
+            for p in peers:
+                p_name = p.get('name', 'unnamed')
+                contexto_peer = f"Peer '{p_name}' em {org_name}"
+
+                chaves_obrigatorias_peers = ['name', 'host', 'port', 'chaincode_port']
+                if not self._chaves_obrigatorias(p, chaves_obrigatorias_peers, contexto_peer):
+                    continue
+
+                # garante que portas sao numeros (evita erros de string no docker-compose)
+                if not isinstance(p['port'], int) or not isinstance(p['chaincode_port'], int):
+                    self.erros.append(f"{contexto_peer}: Portas devem ser números inteiros.")
+
+                # logica de base de dados (state DB), se nao definido o padrao é goLevelDB
+                if 'state_db' not in p:
+                    p['state_db'] = 'GoLevelDB' # Injeção de valor padrão
+                
+                dp_tipo = p['state_db']
+
+                if dp_tipo == 'CouchDB':
+                    # Se escolheu CouchDB, a porta é obrigatória
+                    if 'couchdb_port' not in p:
+                        self.erros.append(f"{contexto_peer}: 'couchdb_port' é obrigatório quando state_db é CouchDB.")
+                    elif not isinstance(p['couchdb_port'], int):
+                        self.erros.append(f"{contexto_peer}: 'couchdb_port' deve ser um número inteiro.")
+                
+                elif dp_tipo == 'GoLevelDB':
+                    # GoLevelDB não precisa de porta extra
+                    pass 
+                
+                else:
+                    self.erros.append(f"{contexto_peer}: state_db inválido ('{dp_tipo}'). Use 'CouchDB' ou 'GoLevelDB'.")
+
+    def _valida_orderer(self):
+        """
+        Valida o servico de ordenacao, consenso (Raft/BFT) e tamanho de bloco.
+        """
+        ord_secao = self.topologia.get('orderer', {})
+        if self._chaves_obrigatorias(ord_secao, ['type', 'nodes', 'batch_timeout', 'batch_size', 'ca'], "seção 'orderer'"):
+            
+            # Valida tipo de consenso
+            tipos_validos = ['etcdraft', 'BFT']
+            if ord_secao['type'] not in tipos_validos:
+                self.erros.append(f"Tipo de orderer inválido: '{ord_secao['type']}'. Permitidos: {tipos_validos}")
+
+            # valida tam_lote
+            tam_lot = ord_secao['batch_size']
+            if self._chaves_obrigatorias(tam_lot, ['max_message_count', 'absolute_max_bytes', 'preferred_max_bytes'], "batch_size do orderer"):
+                if not isinstance(tam_lot['max_message_count'], int):
+                    self.erros.append("orderer.batch_size.max_message_count deve ser um inteiro.")
+
+            # Valida nós
+            nodes = ord_secao.get('nodes', [])
+            if not nodes:
+                self.erros.append("Orderer deve ter pelo menos um nó definido.")
+            
+            for node in nodes:
+                if self._chaves_obrigatorias(node, ['name', 'host', 'port', 'admin_port'], "nodes do Orderer"):
+                     if not isinstance(node['port'], int) or not isinstance(node['admin_port'], int):
+                        self.erros.append(f"Orderer node '{node.get('name')}' tem portas inválidas (devem ser inteiros).")
+
+            # valida ca
+            ca = ord_secao.get('ca')
+            if not self._chaves_obrigatorias(ca, ['name', 'host', 'port'], "CA do Orderer"):
+                self.erros.append("Orderer deve ter uma CA definida com 'name', 'host' e 'port'.")
+            
+    # valida a seção canais
+    def _valida_canais(self):
+        canais = self.topologia.get('channels', [])
+        # canais nao sao opcionais, precisamos ter ao menos um canal e que esse canal contenha todas as orgs para o bootstral
+        c_all = False
+
+        if len(canais) < 1:
+            self.erros.append("Nenhum canal definido na seção 'channels'. Definir pelo menos um canal que contenha todas as orgs para bootstrap inicial. ")
+            return
+        
+        if not isinstance(canais, list):
+            self.erros.append("A seção 'channels' deve ser uma lista.")
+            return
+
+        for c in canais:
+            if self._chaves_obrigatorias(c, ['name', 'participating_orgs'], f"Seção channels - {c.get('name', '')}"):
+                part_orgs = c['participating_orgs']
+
+                # verifica se existe algum canal que contenha todas as orgs
+                if len(part_orgs) == len(self.orgs_definidas):
+                    c_all = True
+
+                # as orgs do canal existem?
+                for org_name in part_orgs:
+                    if org_name not in self.orgs_definidas:
+                        self.erros.append(f"Canal '{c['name']}' referencia a organização '{org_name}', mas ela não foi definida em 'organizations'.")
+
+        if not c_all:
+            self.erros.append("Nenhum canal definido contém todas as organizações. É necessário ter pelo menos um canal com todas as orgs para bootstrap inicial.")       
+
+    # valida a seção chaincodes, ainda não validando isso, futuramente preciso ver isso
+    def _valida_chaincodes(self):
+        ccs = self.topologia.get('chaincodes', [])
+        channels = self.topologia.get('channels', [])
+
+        if len(ccs) < 1:
+            self.erros.append("Nenhum chaincode definido na seção 'chaincodes'. Definir pelo menos um chaincode.")
+            return 
+        
+        for cc in ccs:
+            if self._chaves_obrigatorias(cc, ['name', 'path', 'channel', 'version', 'lang', 'sequence', 'endorsement_policy'], f"seção 'chaincodes' - '{cc['name']}'"):
+                if not os.path.exists(cc['path']):
+                    self.erros.append(f"Chaincode '{cc['name']}' não existe: {cc['path']} não encontrado.")
+                if cc['channel'] not in [ch['name'] for ch in channels]:
+                    self.erros.append(f"Chaincode '{cc['name']}' referencia canal '{cc['channel']}' que não foi definido em 'channels'.")
+                
+                # valida Private Data Collections se houver
+                if 'pdc' in cc:
+                    if not isinstance(cc['pdc'], list):
+                        self.erros.append(f"PDC do chaincode '{cc['name']}' deve ser uma lista.")
+                    else:
+                        for pdc in cc['pdc']:
+                            self._chaves_obrigatorias(pdc, ['name', 'policy', 'required_peer_count', 'max_peer_count', 'block_to_live', 'member_only_read', 'member_only_write'], f"PDC do chaincode {cc['name']}")
